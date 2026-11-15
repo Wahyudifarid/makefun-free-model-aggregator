@@ -1,55 +1,43 @@
-// free-model-aggregator-01's starter kit: one server, two client wires, a directory of free providers.
+// free-model-aggregator-01: one server, two client wires, a directory of free providers.
 //
-// This is a working entry to start from, not a competitive answer. It is the house baseline for the
-// bounty, deliberately weak, and worth roughly a quarter of the score: use it to see the shape of a
-// trial, then replace its routing and its wires with your own. The gaps are marked TODO below.
+// The trial gives this server a brief (provider directory, sealed quality
+// table, workload manifest) and an env that serves the providers. The server
+// probes every provider's catalog route, builds one catalog, registers its
+// port and catalog, then serves the client's 20 requests, one at a time, and
+// exits 0 when the env says the workload is done.
 //
-// WHAT A TRIAL GIVES YOU
-//   A trial gives this server a brief and an env, and runs it as `node /bot/main.ts` from your
-//   repository's root, with Node 22's standard library alone (nothing is installed; TypeScript runs
-//   directly, and a relative import needs its .ts extension). The brief is at the path in
-//   $MAKEFUN_PROMPT_FILE. It carries three JSON documents:
-//     - the provider directory: ten simulated free-tier providers, each with its id, wire (openai,
-//       anthropic or gemini), auth scheme, key environment variable, the key the service takes, and the
-//       base path you join to $MAKEFUN_ENV_URL;
-//     - the quality table: every model's public rating and what it can do (tools, vision, JSON mode,
-//       context length), and whether it is free;
-//     - the workload manifest: the twenty requests the client will send, in order, with each one's api,
-//       whether it streams, its weight and the requirements a model must meet to serve it.
-//   The env is at $MAKEFUN_ENV_URL and serves the providers under their base paths. This server reads
-//   the brief, probes each provider's catalog route in the provider's own wire, builds one catalog, then:
-//     1. listens on 0.0.0.0 at a free port (never 8080: the env itself is there on one layout);
-//     2. POSTs $MAKEFUN_ENV_URL/register {"protocol_version": 1, "port": <port>, "catalog": <catalog>};
-//     3. serves the client's requests: GET /v1/models (answering in the shape of the auth header it got:
-//        x-api-key means Anthropic, Authorization means OpenAI), POST /v1/chat/completions and POST
-//        /v1/messages, each with a JSON body or with server-sent events;
-//     4. polls GET $MAKEFUN_ENV_URL/work every 100 ms and exits 0 when the env says {"done": true}. A
-//        process still running when the wall ends scores zero, so never wait for anything else.
-//   `node main.ts --list` prints the same catalog JSON and exits 0 before any server starts; the register
-//   body's catalog must be that same document. Build it once, as this file does, and use the one object.
+// ROUTING (quality is 60% of the score, served 15%, failover 10%)
+//   The manifest is known up front, so the workload is planned before the
+//   first request arrives: each request is assigned the highest-rated free
+//   model meeting its requirements, with at most PLAN_CAP planned calls on
+//   any one provider, so no provider's hidden free-tier budget is spent on
+//   one request family and a failure schedule or outage on one provider can
+//   only take a few requests down. Ties break by fewest planned calls, then
+//   provider id, then model id: every choice is a function of the brief.
+//   A JSON-mode request from the OpenAI client wire is never routed to an
+//   anthropic-wire provider: that wire carries no response_format, so the
+//   provider would echo json_mode false and the request would fail.
+//   On a refusal (402, 429, 5xx, or an unreachable provider) the request is
+//   retried on the next candidate, preferring the highest rating among the
+//   least-used providers; a provider that has refused twice is treated as
+//   spent unless no other candidate remains. Calls are strictly sequential:
+//   the client sends one request at a time and this server sends one
+//   upstream call at a time, so a provider never sees a concurrent call.
 //
-// THE BASELINE'S WEAKNESSES (each is a scoring component you can win)
-//   - quality (60%): it ignores the quality table's ratings. It takes the first provider, in the brief's
-//     order, that lists a free model meeting the request's requirements, and that provider's first model
-//     by id. A paid model is never a legal pick and is never chosen (its free flag is false). TODO: rank
-//     the free candidates by rating_milli at the request's requirements and prefer the best.
-//   - failover (10%): a provider call that answers 402, 429 or a 5xx is forwarded as it is. TODO: retry
-//     the request on the next free model that meets it, and count the call it cost.
-//   - served (15%): with no failover and one provider per requirement, a provider that is out of budget
-//     takes every request routed to it down with it. TODO: spread calls over providers under their
-//     per-trial budgets.
-//   - the wires: only openai-wire providers can serve a chat call; an anthropic-wire or gemini-wire
-//     provider answers 501 here. The catalog probe already speaks all three wires. TODO: build the other
-//     two upstream requests and their event shapes.
-//   - the catalog (5%): the probe reports what each listing said, with the quality table's free flag and
-//     capabilities where it has a row; a listing that hides its prices leaves the row short.
-//   The trial's rules are in the kit's RULES.txt; read them for the score's columns and the tie-break.
+// WIRES (10%): every client wire x upstream wire pair is translated in
+// lib/translate.ts (and lib/wire.ts for the Anthropic <-> OpenAI pair): the
+// system prompt, user text and images, tools, stop sequences, max_tokens
+// and JSON mode cross unchanged; usage is reported as the upstream wire
+// reported it; stop reasons map across the families. Streams are rebuilt
+// from the provider's frames: the OpenAI stream ends with a usage chunk and
+// [DONE], the Anthropic one with message_delta then message_stop.
 //
-// FILES
-//   main.ts            this server: the brief, the catalog, the routes, the register and the poll.
-//   lib/providers.ts   the brief's types and parser, the auth headers, the catalog probe.
-//   lib/wire.ts        Anthropic <-> Chat Completions translation and the SSE writers.
-//   LICENSE            MIT: keep it or replace it with another OSI-approved license.
+// DETERMINISM: no clock, no randomness anywhere in this file or lib/.
+// Every decision derives from the brief, the requests and the provider
+// answers seen so far, so a replay leaves the same state export.
+//
+// `node main.ts --list` prints the same catalog JSON the register body
+// carries, byte for byte, and exits 0 before any server starts.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -79,6 +67,17 @@ import {
   openAIToAnthropic,
   type ServedModel,
 } from './lib/wire.ts';
+import {
+  anthropicEventsFromGeminiText,
+  anthropicJsonFromGemini,
+  anthropicToGeminiUpstream,
+  openAIChunksFromAnthropicText,
+  openAIChunksFromGeminiText,
+  openAIJsonFromAnthropic,
+  openAIJsonFromGemini,
+  openAIToAnthropicUpstream,
+  openAIToGeminiUpstream,
+} from './lib/translate.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -86,8 +85,18 @@ const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
 /** How long one provider's catalog probe may take, in milliseconds. */
 const PROBE_TIMEOUT_MS = 5000;
-/** The most bytes of one client request body this baseline reads. */
+/** How long one upstream provider call may take, in milliseconds. */
+const UPSTREAM_TIMEOUT_MS = 10000;
+/** The most bytes of one client request body this server reads. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
+/** The most planned calls on any one provider: spread the workload so one
+ *  provider's hidden budget, failure schedule or outage cannot take the
+ *  trial down, and leave headroom for failover retries. */
+const PLAN_CAP = 3;
+/** The most upstream attempts for one client request. */
+const MAX_ATTEMPTS = 8;
+/** A provider that has refused this many times is treated as spent. */
+const SPENT_FAILURES = 2;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -97,6 +106,12 @@ let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
+/** The planned route per manifest request id. */
+const planById = new Map<string, Route>();
+/** Upstream calls made per provider, failures included: the budget signal. */
+const callsUsed = new Map<string, number>();
+/** Upstream refusals per provider. */
+const failures = new Map<string, number>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -108,6 +123,7 @@ async function load(): Promise<void> {
   probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
+  buildPlan();
 }
 
 const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -131,23 +147,75 @@ interface Route {
   model: ProbedModel;
 }
 
+interface Candidate {
+  probe: Probe;
+  model: ProbedModel;
+  rating: number;
+}
+
 /**
- * The provider and model that serve one request. TODO(quality): rank every free candidate that meets the
- * requirements by the quality table's rating_milli (quality is 60% of the score) and plan each provider's
- * per-trial budget. This baseline takes the first provider, in the brief's order, whose listing answered
- * with a free model meeting the requirements, and that provider's first model by id.
+ * Every free model that can legally serve a request on `clientApi`: it meets
+ * the requirements, and its wire can carry what the request needs (an
+ * OpenAI JSON-mode request needs a wire with a JSON-mode carrier).
  */
-function routeFor(requires: Requirement): Route | null {
+function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic'): Candidate[] {
+  const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    for (const model of [...probe.models].sort(byId)) {
+    for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      return { probe, model };
+      if (clientApi === 'openai' && requires.json === true && probe.provider.wire === 'anthropic') continue;
+      out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
-  return null;
+  return out;
+}
+
+/**
+ * Candidate order: highest rating first, then fewest calls on that provider,
+ * then fewest refusals, then provider id, then model id. Deterministic: no
+ * clock, no randomness, only the brief and what the trial has shown so far.
+ */
+function compareCandidates(a: Candidate, b: Candidate, usage: ReadonlyMap<string, number>, refused: ReadonlyMap<string, number>): number {
+  if (a.rating !== b.rating) return b.rating - a.rating;
+  const ua = usage.get(a.probe.provider.id) ?? 0;
+  const ub = usage.get(b.probe.provider.id) ?? 0;
+  if (ua !== ub) return ua - ub;
+  const fa = refused.get(a.probe.provider.id) ?? 0;
+  const fb = refused.get(b.probe.provider.id) ?? 0;
+  if (fa !== fb) return fa - fb;
+  if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
+  return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
+}
+
+/** Plan the whole manifest up front: best-rated legal model per request, capped per provider. */
+function buildPlan(): void {
+  const manifest = brief.workload?.manifest ?? [];
+  const planned = new Map<string, number>();
+  for (const entry of manifest) {
+    const cands = candidatesFor(entry.requires, entry.api).sort((a, b) => compareCandidates(a, b, planned, failures));
+    const pick = cands.find((c) => (planned.get(c.probe.provider.id) ?? 0) < PLAN_CAP) ?? cands[0] ?? null;
+    if (pick === null) {
+      log(`no free model meets ${entry.id}`);
+      continue;
+    }
+    planned.set(pick.probe.provider.id, (planned.get(pick.probe.provider.id) ?? 0) + 1);
+    planById.set(entry.id, { probe: pick.probe, model: pick.model });
+  }
+}
+
+/** The next route to try for a request, excluding providers already tried this request. */
+function nextRoute(requires: Requirement, clientApi: 'openai' | 'anthropic', triedProviders: ReadonlySet<string>, triedPairs: ReadonlySet<string>): Route | null {
+  const cands = candidatesFor(requires, clientApi);
+  if (cands.length === 0) return null;
+  const healthy = cands.filter((c) => (failures.get(c.probe.provider.id) ?? 0) < SPENT_FAILURES);
+  const pool = healthy.length > 0 ? healthy : cands;
+  const untried = pool.filter((c) => !triedProviders.has(c.probe.provider.id));
+  const ordered = (untried.length > 0 ? untried : pool).sort((a, b) => compareCandidates(a, b, callsUsed, failures));
+  const pick = ordered.find((c) => !triedPairs.has(`${c.probe.provider.id}/${c.model.id}`)) ?? ordered[0] ?? null;
+  return pick === null ? null : { probe: pick.probe, model: pick.model };
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -156,8 +224,6 @@ function requirementsFor(body: Json): Requirement {
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
   if (entry !== undefined) return entry.requires;
-  // TODO(workload): the manifest is the declared source of each request's requirements; this fallback is a
-  // guess for a brief that holds none.
   return requirementsFromBody(body);
 }
 
@@ -200,6 +266,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
+function sendSse(res: ServerResponse, text: string): void {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  res.end(text);
+}
+
 function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
   if (wire === 'anthropic') sendJson(res, status, anthropicError(type, message));
   else sendJson(res, status, openAIError(message, type, null));
@@ -212,90 +283,175 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
-/** POST one request to the routed provider's Chat Completions route. */
-async function callProvider(route: Route, body: Json): Promise<Response> {
-  const base = joinBase(ENV_URL, route.probe.provider.base);
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    ...authHeaders(route.probe.provider.auth, route.probe.provider.key),
-  };
-  if (body.stream === true) headers.accept = 'text/event-stream';
-  return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body) });
+interface UpstreamResult {
+  ok: boolean;
+  status: number;
+  text: string;
 }
 
-/** Copy a provider's event stream to the client as it arrives. */
-async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
-  const reader = stream.getReader();
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
+/** One upstream provider call in the provider's own wire. Sequential by construction. */
+async function callUpstream(route: Route, clientApi: 'openai' | 'anthropic', body: Json, stream: boolean): Promise<UpstreamResult> {
+  const provider = route.probe.provider;
+  const base = joinBase(ENV_URL, provider.base);
+  const headers: Record<string, string> = { 'content-type': 'application/json', ...authHeaders(provider.auth, provider.key) };
+  if (stream) headers.accept = 'text/event-stream';
+  let url: string;
+  let upstreamBody: Json;
+  if (provider.wire === 'openai') {
+    url = `${base}/v1/chat/completions`;
+    // An Anthropic client body must be rewritten into Chat Completions
+    // first: sent as-is, the provider would parse no system prompt, no
+    // tools and no stop sequences out of it.
+    const out: Json = clientApi === 'openai' ? { ...body, model: route.model.id } : anthropicToOpenAI(body, route.model.id);
+    if (stream) {
+      const streamOptions = isRecord(body.stream_options) ? body.stream_options : {};
+      out.stream_options = { ...streamOptions, include_usage: true };
     }
-  } finally {
-    reader.releaseLock();
-    res.end();
+    upstreamBody = out;
+  } else if (provider.wire === 'anthropic') {
+    url = `${base}/v1/messages`;
+    headers['anthropic-version'] = '2023-06-01';
+    upstreamBody = clientApi === 'openai' ? openAIToAnthropicUpstream(body, route.model.id) : { ...body, model: route.model.id };
+  } else {
+    url = `${base}/v1beta/models/${encodeURIComponent(route.model.id)}:${stream ? 'streamGenerateContent' : 'generateContent'}`;
+    upstreamBody = clientApi === 'openai' ? openAIToGeminiUpstream(body) : anthropicToGeminiUpstream(body);
+  }
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(upstreamBody),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text };
+  } catch (err) {
+    log(`upstream ${provider.id} unreachable: ${(err as Error).message}`);
+    return { ok: false, status: 0, text: '' };
   }
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by an openai-wire provider. */
+function textToStream(text: string): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(text));
+      controller.close();
+    },
+  });
+}
+
+function parseObject(text: string): Json | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return isRecord(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The client's answer from one successful upstream call, converted into the
+ * client's wire. Returns false when the upstream answer cannot be converted
+ * (the caller then fails over to the next candidate).
+ */
+async function answerFromUpstream(
+  res: ServerResponse,
+  clientApi: 'openai' | 'anthropic',
+  stream: boolean,
+  route: Route,
+  result: UpstreamResult,
+): Promise<boolean> {
+  const wire = route.probe.provider.wire;
+  const modelId = route.model.id;
+  try {
+    if (clientApi === 'openai') {
+      if (!stream) {
+        const answer = parseObject(result.text);
+        if (answer === null) return false;
+        if (wire === 'openai') sendJson(res, 200, answer);
+        else if (wire === 'anthropic') sendJson(res, 200, openAIJsonFromAnthropic(answer, modelId));
+        else sendJson(res, 200, openAIJsonFromGemini(answer, modelId));
+        return true;
+      }
+      const sse = wire === 'openai' ? result.text : wire === 'anthropic' ? openAIChunksFromAnthropicText(result.text, modelId) : openAIChunksFromGeminiText(result.text, modelId);
+      sendSse(res, sse);
+      return true;
+    }
+    if (!stream) {
+      const answer = parseObject(result.text);
+      if (answer === null) return false;
+      if (wire === 'anthropic') sendJson(res, 200, answer);
+      else if (wire === 'openai') sendJson(res, 200, openAIToAnthropic(answer, modelId));
+      else sendJson(res, 200, anthropicJsonFromGemini(answer, modelId));
+      return true;
+    }
+    if (wire === 'anthropic') {
+      sendSse(res, result.text);
+      return true;
+    }
+    if (wire === 'openai') {
+      const events: string[] = [];
+      for await (const event of anthropicEventsFromOpenAI(textToStream(result.text), modelId)) events.push(event);
+      sendSse(res, events.join(''));
+      return true;
+    }
+    sendSse(res, anthropicEventsFromGeminiText(result.text, modelId));
+    return true;
+  } catch (err) {
+    log(`converting ${wire} answer failed: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+/** Serve one client request: planned route first, then failover over candidates. */
+async function serve(req: IncomingMessage, res: ServerResponse, clientApi: 'openai' | 'anthropic', body: Json): Promise<void> {
+  const manifest = brief.workload?.manifest ?? [];
+  const entry = manifest[manifestIndex];
+  const requires = requirementsFor(body);
+  const stream = body.stream === true;
+  const triedProviders = new Set<string>();
+  const triedPairs = new Set<string>();
+  let route: Route | null = null;
+  if (entry !== undefined) {
+    const planned = planById.get(entry.id);
+    if (planned !== undefined && (failures.get(planned.probe.provider.id) ?? 0) < SPENT_FAILURES) route = planned;
+  }
+  let attempts = 0;
+  while (attempts < MAX_ATTEMPTS) {
+    if (route === null) {
+      route = nextRoute(requires, clientApi, triedProviders, triedPairs);
+      if (route === null) break;
+    }
+    attempts += 1;
+    const providerId = route.probe.provider.id;
+    triedProviders.add(providerId);
+    triedPairs.add(`${providerId}/${route.model.id}`);
+    const result = await callUpstream(route, clientApi, body, stream);
+    callsUsed.set(providerId, (callsUsed.get(providerId) ?? 0) + 1);
+    if (result.ok) {
+      if (await answerFromUpstream(res, clientApi, stream, route, result)) return;
+      log(`upstream ${providerId} answered unusable bytes; failing over`);
+    } else {
+      log(`upstream ${providerId} refused HTTP ${result.status}; failing over`);
+    }
+    failures.set(providerId, (failures.get(providerId) ?? 0) + 1);
+    route = null;
+  }
+  sendError(res, clientApi, 503, clientApi === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model on the directory meets this request');
+}
+
+/** POST /v1/chat/completions: an OpenAI-shaped client. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
-  if (route.probe.provider.wire !== 'openai') {
-    // TODO(wires): build the gemini or anthropic upstream request (and its event shape) instead of 501.
-    return sendError(res, 'openai', 501, 'not_implemented', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
-  }
-  let upstream: Response;
-  try {
-    upstream = await callProvider(route, { ...body, model: route.model.id });
-  } catch (err) {
-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
-  }
-  if (body.stream === true && upstream.ok && upstream.body !== null) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    await pipeStream(upstream.body, res);
-    return;
-  }
-  // TODO(failover): a 402, 429 or 5xx here ends the request. Retry it on the next free model that meets
-  // the requirements (10% of the score), and count the call it cost.
-  const text = await upstream.text();
-  res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-  res.end(text);
+  await serve(req, res, 'openai', body);
 }
 
-/** POST /v1/messages: an Anthropic-shaped client, rewritten to an openai-wire provider and answered back. */
+/** POST /v1/messages: an Anthropic-shaped client. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
-  if (route.probe.provider.wire !== 'openai') {
-    return sendError(res, 'anthropic', 501, 'api_error', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
-  }
-  const requested = typeof body.model === 'string' && body.model !== '' ? body.model : route.model.id;
-  let upstream: Response;
-  try {
-    upstream = await callProvider(route, anthropicToOpenAI(body, route.model.id));
-  } catch (err) {
-    return sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);
-  }
-  if (!upstream.ok) {
-    // TODO(failover): a 402, 429 or 5xx here ends the request. Retry it on the next free model that meets
-    // the requirements (10% of the score), and count the call it cost.
-    const text = await upstream.text();
-    return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${text.slice(0, 500)}`));
-  }
-  if (body.stream === true && upstream.body !== null) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
-    res.end();
-    return;
-  }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, requested));
+  await serve(req, res, 'anthropic', body);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
